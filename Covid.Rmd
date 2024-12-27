@@ -1,0 +1,188 @@
+---
+title: "Assignment 14 Using XGBoost Model"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(xgboost)
+library(caret)
+library(data.table)
+library(rvest)
+```
+
+Loading the given dataset as mydata dataframe
+```{r, echo=TRUE, message=FALSE, warning=FALSE}
+# Load the given dataset
+mydata <- fread('/Users/utsingh/Downloads/flinfo2022.csv')
+# Display header and first few rows of mydata
+head(mydata)
+```
+
+Data cleansing
+```{r}
+# Delete the unassigned county name
+mydata <- subset(mydata, (Admin2 != "Unassigned"))
+# Drop unnecessary columns
+columns_to_drop <- c('V1', 'FIPS', 'Province_State', 'Country_Region', 'Last_Update', 'Latitude', 'Longitude', 'Recovered', 'Active', 'Combined_Key')
+mydata <- mydata %>% select(-all_of(columns_to_drop))
+head(mydata)
+```
+
+Loading hospital beds data and adding that to mydata
+```{r}
+# Load hospital beds data (extracted from this website- https://www.flhealthcharts.gov/ChartsReports/rdPage.aspx?rdReport=NonVitalInd.DataViewer&cid=313)
+hosp_beds <- fread('/Users/utsingh/Downloads/florida_hospital_beds_cleaned_2020.csv')
+
+# Rename County column name to ensure correct merge
+colnames(hosp_beds)[colnames(hosp_beds) == 'County'] <- 'Admin2'
+
+# Merging hospital beds data with mydata
+mydata <- merge(mydata, hosp_beds, by = "Admin2", all.x = TRUE)
+head(mydata)
+```
+
+Calculating and saving beds per population
+```{r}
+# Create new feature (beds per population)
+mydata <- mydata %>%
+  mutate(
+    beds_per_popu = ifelse(population > 0, Hospital_Beds / population, NA)  # Avoid division by zero
+  )
+head(mydata)
+```
+
+Loading poverty rate data and adding that to mydata
+```{r}
+# Load Poverty rate data (extracted from this website- https://www.flhealthcharts.gov/ChartsDashboards/rdPage.aspx?rdReport=NonVitalInd.Dataviewer&cid=294)
+Poverty_Rate <- fread("/Users/utsingh/Downloads/HDPulse_data_export.csv")
+# Remove the word “County” from the values in the Admin2 column
+colnames(Poverty_Rate)[colnames(Poverty_Rate) == 'County'] <- 'Admin2'
+
+# Match the content of mydata
+Poverty_Rate$Admin2 <- gsub(" County", "", Poverty_Rate$Admin2)
+
+# Left join
+mydata <- left_join(mydata, Poverty_Rate, by = "Admin2")
+head(mydata)
+```
+
+Loading county wise population density data and adding that to mydata
+```{r}
+# getting other data - land area
+library(rvest)
+webpage <- "http://www.usa.com/rank/florida-state--land-area--county-rank.htm"
+read_html(webpage)
+
+url <- webpage
+pageobj <- read_html(url, as.data.frame=T, stringsAsFactors = TRUE)
+pageobj %>%  
+  html_nodes("table") %>% 
+  #Indicate that this is the table to be extracted
+  .[[2]] %>%
+  html_table(fill=T) -> x
+coltitle <- as.character(x[1,]) # read the column names from row 1
+colnames(x) <- coltitle # add the column names to x
+x <- x[-1,-1] # remove the first row and the 1st column of the data
+landarea <- as.data.frame(x)
+colnames(landarea) <- c("SQMiles", "Admin2")
+# clean up the data of landarea
+landarea$SQMiles <- as.numeric((gsub("[\\$, sq mi]", "", landarea$SQMiles)))
+landarea$Admin2 = as.character(gsub(", FL /", "", landarea$Admin2))
+landarea$Admin2 = as.character(gsub(",", "", landarea$Admin2))
+landarea$Admin2 = as.character(gsub(" [0-9]", "", landarea$Admin2))
+landarea$Admin2 = as.character(gsub("[0-9]", "", landarea$Admin2))
+landarea$Admin2[landarea$Admin2 == "Saint Johns"] <-"St. Johns"
+landarea$Admin2[landarea$Admin2 == "Saint Lucie"] <-"St. Lucie"
+landarea$Admin2[landarea$Admin2 == "De Soto"] <-"DeSoto"
+# add the land area to the data frame
+mydata <- merge(x=mydata, y=landarea, by="Admin2", all.x = TRUE)
+
+# create a new variable that is population density
+mydata$pop_density <- mydata$population / mydata$SQMiles
+head(mydata)
+```
+
+Loading median age data and adding that to mydata
+```{r}
+# Load median age (extracted from this website- https://www.flhealthcharts.gov/ChartsDashboards/rdPage.aspx?rdReport=NonVitalIndRateOnly.TenYrsRpt&cid=300)
+med_age <- read.csv("/Users/utsingh/Downloads/Median_age_FL.csv")
+
+# Match the content of mydata
+colnames(med_age)[colnames(med_age) == 'X'] <- 'Admin2'
+colnames(med_age)[colnames(med_age) == 'X2022'] <- 'median_age'
+
+# Left join
+mydata <- left_join(mydata, med_age, by = "Admin2")
+head(mydata)
+```
+Check Summary of mydata
+```{r}
+summary(mydata)
+```
+Select columns to be used for the XGBoost model
+```{r}
+# Select features for the model 
+X_features <- mydata %>%
+  select(beds_per_popu, poverty_rate, pop_density, median_age)
+y <- mydata$Case_Fatality_Ratio
+```
+
+Convert data to matrix format
+```{r}
+# Convert to matrix format for XGBoost
+X_matrix <- as.matrix(X_features)
+y_vector <- as.numeric(y)
+```
+
+Train the model
+```{r}
+# Train XGBoost model
+xgboost_model <- xgboost(
+  data = X_matrix,
+  label = y_vector,
+  nrounds = 30,
+  params = list(
+    eta = 0.08,
+    max_depth = 2,
+    min_child_weight = 3,
+    objective = 'reg:squarederror',
+    eval_metric = 'rmse'
+  ),
+  verbose = FALSE
+)
+```
+
+Calculate R-squared value to check model accuracy and print it
+```{r}
+# Make predictions and calculate R²
+predictions <- predict(xgboost_model, X_matrix)
+SSE <- sum((y_vector - predictions) ^ 2)
+SST <- sum((y_vector - mean(y_vector)) ^ 2)
+R_squared <- 1 - (SSE / SST)
+
+# Print R² value
+cat("R² for the Case Fatality Rate prediction is:", R_squared, "\n")
+```
+Plot Residual Plot
+```{r}
+# Residual plot
+residuals <- y_vector - predictions
+ggplot(data.frame(predictions, residuals), aes(x = predictions, y = residuals)) +
+  geom_point() +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "orange") +
+  labs(title = "Residual Plot", x = "Predicted Values", y = "Residuals")
+```
+Plot Actual vs. Predicted plot
+```{r}
+# Actual vs. Predicted plot
+ggplot(data.frame(actual = y_vector, predicted = predictions), aes(x = actual, y = predicted)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "blue") +
+  labs(title = "Actual vs. Predicted", x = "Actual Values", y = "Predicted Values")
+```
